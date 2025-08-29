@@ -1,7 +1,6 @@
 import logging
 import logging.handlers
 import os
-from typing import Dict
 
 _LOG_FOLDER = os.path.join(os.path.expanduser("~"), ".seventeenlands")
 if not os.path.exists(_LOG_FOLDER):
@@ -12,7 +11,7 @@ _LOG_FORMATTER = logging.Formatter(
     "%(asctime)s.%(msecs)03d,%(levelname)s,%(name)s,%(message)s",
     datefmt="%Y%m%d %H%M%S",
 )
-_HANDLERS = {
+_HANDLERS: set[logging.Handler] = {
     logging.handlers.TimedRotatingFileHandler(
         _LOG_FILENAME,
         when="D",
@@ -23,7 +22,7 @@ _HANDLERS = {
     logging.StreamHandler(),
 }
 
-_loggers: Dict[str, logging.Logger] = {}
+_loggers: dict[str, logging.Logger] = {}
 
 
 def get_logger(name: str) -> logging.Logger:
