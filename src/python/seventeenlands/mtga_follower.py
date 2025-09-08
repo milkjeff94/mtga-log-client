@@ -32,6 +32,13 @@ from typing import Any, Optional
 import dateutil.parser
 
 import seventeenlands.api_client
+try:
+    # Optional: local statisticaldrafting recommender integration
+    from seventeenlands.recommend_client import RecommendClient, format_recommendations
+except Exception:
+    RecommendClient = None  # type: ignore
+    def format_recommendations(*args, **kwargs):  # type: ignore
+        return ""
 import seventeenlands.logging_utils
 
 logger = seventeenlands.logging_utils.get_logger("17Lands")
@@ -241,12 +248,21 @@ def contains_log_key(key: str, full_log: str) -> bool:
 class Follower:
     """Follows along a log, parses the messages, and passes along the parsed data to the API endpoint."""
 
-    def __init__(self, token: str, host: str) -> None:
+    def __init__(self, token: str, host: str, sd_url: Optional[str] = None, sd_topk: int = 5) -> None:
         self.host = host
         self.token = token
         self.json_decoder = json.JSONDecoder()
         self._api_client = seventeenlands.api_client.ApiClient(host=host)
         self._reinitialize()
+        # StatisticalDrafting integration
+        self._sd_client = None
+        self._sd_topk = sd_topk
+        if sd_url and RecommendClient is not None:
+            try:
+                self._sd_client = RecommendClient(sd_url)
+                logger.info(f"StatisticalDrafting integration enabled at {sd_url}")
+            except Exception as e:
+                logger.warning(f"Failed to initialize SD recommender at {sd_url}: {e}")
 
     def _reinitialize(self) -> None:
         self.buffer: list[str] = []
@@ -293,6 +309,23 @@ class Follower:
         self.recent_lines: list[str] = []
 
         self.__clear_match_data()
+        # SD integration state
+        self.sd_picked_ids: list[int] = []
+
+    # ---- StatisticalDrafting integration helpers ----
+    def __sd_reset_draft(self) -> None:
+        self.sd_picked_ids = []
+
+    def __sd_on_pack(self, pack_ids: list[int], draft_mode: str = "Premier") -> None:
+        if not self._sd_client:
+            return
+        try:
+            rec = self._sd_client.recommend(pack_ids=pack_ids, picked_ids=self.sd_picked_ids, draft_mode=draft_mode)
+            if rec and rec.get("recommendations"):
+                msg = format_recommendations(rec["recommendations"], top_k=self._sd_topk)
+                logger.info(f"SD picks:\n{msg}")
+        except Exception as e:
+            logger.warning(f"SD recommend error: {e}")
 
     def _add_base_api_data(self, blob: dict[str, Any]) -> dict[str, Any]:
         return {
@@ -1173,6 +1206,12 @@ class Follower:
         """Handle 'DraftStatus' messages."""
         if json_obj["DraftStatus"] == "PickNext":
             self.__clear_game_data()
+            # Reset SD state for first pack/pick
+            try:
+                if int(json_obj.get("PackNumber", 0)) == 1 and int(json_obj.get("PickNumber", 0)) == 1:
+                    self.__sd_reset_draft()
+            except Exception:
+                pass
 
             try:
                 self.cur_draft_event = json_obj["EventName"]
@@ -1185,6 +1224,8 @@ class Follower:
                 }
                 logger.info(f"Draft pack: {pack}")
                 self._api_client.submit_draft_pack(self._add_base_api_data(pack))
+                # SD recommendation
+                self.__sd_on_pack(pack_ids=pack["card_ids"], draft_mode="Trad")
 
             except Exception as e:
                 self._log_error(
@@ -1210,6 +1251,16 @@ class Follower:
             }
             logger.info(f"Draft pick: {pick}")
             self._api_client.submit_draft_pick(self._add_base_api_data(pick))
+            # Update SD picked ids
+            try:
+                if pick.get("card_id") is not None:
+                    self.sd_picked_ids.append(int(pick["card_id"]))
+                elif pick.get("card_ids"):
+                    # Some formats present multiple picks
+                    for cid in pick["card_ids"]:
+                        self.sd_picked_ids.append(int(cid))
+            except Exception:
+                pass
 
         except Exception as e:
             self._log_error(
@@ -1225,6 +1276,7 @@ class Follower:
         try:
             self.cur_draft_event = json_obj["EventName"]
             logger.info(f"Joined draft pod: {self.cur_draft_event}")
+            self.__sd_reset_draft()
 
         except Exception as e:
             self._log_error(
@@ -1267,6 +1319,11 @@ class Follower:
             }
             logger.info(f"Human draft pack (combined): {pack}")
             self._api_client.submit_human_draft_pack(self._add_base_api_data(pack))
+            # SD recommendation
+            try:
+                self.__sd_on_pack(pack_ids=[int(x) for x in json_obj["CardsInPack"]], draft_mode="Premier")
+            except Exception:
+                pass
 
         except Exception as e:
             self._log_error(
@@ -1293,6 +1350,12 @@ class Follower:
             }
             logger.info(f"Human draft pick (combined): {pick}")
             self._api_client.submit_human_draft_pick(self._add_base_api_data(pick))
+            # Update SD picked ids
+            try:
+                if pick.get("card_id") is not None:
+                    self.sd_picked_ids.append(int(pick["card_id"]))
+            except Exception:
+                pass
 
         except Exception as e:
             self._log_error(
@@ -1317,6 +1380,11 @@ class Follower:
             }
             logger.info(f"Human draft pack (Draft.Notify): {pack}")
             self._api_client.submit_human_draft_pack(self._add_base_api_data(pack))
+            # SD recommendation
+            try:
+                self.__sd_on_pack(pack_ids=pack["card_ids"], draft_mode="Premier")
+            except Exception:
+                pass
 
         except Exception as e:
             self._log_error(
@@ -1705,6 +1773,17 @@ def main() -> None:
         action="store_true",
         help="Whether to stop after parsing the file once (default is to continue waiting for updates to the file)",
     )
+    parser.add_argument(
+        "--sd-url",
+        default=os.environ.get("SD_RECOMMENDER_URL", ""),
+        help="Optional StatisticalDrafting recommender base URL (e.g., http://127.0.0.1:5055). If empty, integration is disabled.",
+    )
+    parser.add_argument(
+        "--sd-topk",
+        type=int,
+        default=int(os.environ.get("SD_RECOMMENDER_TOPK", "5")),
+        help="How many recommendations to print from SD recommender.",
+    )
 
     args = parser.parse_args()
 
@@ -1719,7 +1798,48 @@ def main() -> None:
     token = args.token
     logger.info(f"Using token {token[:4]}...{token[-4:]}")
 
-    processing_loop(args, token)
+    # Propagate SD args by monkey-patching follower construction via wrapper
+    orig_follower_cls = Follower
+
+    def _make_follower(token: str, host: str) -> Follower:  # type: ignore[name-defined]
+        return orig_follower_cls(token=token, host=host, sd_url=args.sd_url, sd_topk=args.sd_topk)
+
+    # Patch processing_loop locally to pass sd args
+    def _processing_loop(args: argparse.Namespace, token: str) -> None:
+        filepaths = POSSIBLE_CURRENT_FILEPATHS
+        if args.log_file is not None:
+            filepaths = [args.log_file]
+
+        follow = not args.once
+
+        follower = _make_follower(token, host=args.host)
+
+        if (
+            args.log_file is None
+            and args.host == seventeenlands.api_client.DEFAULT_HOST
+            and follow
+        ):
+            for filename in POSSIBLE_PREVIOUS_FILEPATHS:
+                if os.path.exists(filename):
+                    logger.info(f"Parsing the previous log {filename} once")
+                    follower.parse_log(filename=filename, follow=False)
+                    break
+
+        any_found = False
+        for filename in filepaths:
+            if os.path.exists(filename):
+                any_found = True
+                logger.info(f"Following along {filename}")
+                follower.parse_log(filename=filename, follow=follow)
+
+        if not any_found:
+            logger.warning(
+                "Found no files to parse. Try to find Arena's Player.log file and pass it as an argument with -l"
+            )
+
+        logger.info("Exiting")
+
+    _processing_loop(args, token)
 
 
 if __name__ == "__main__":
